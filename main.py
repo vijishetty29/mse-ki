@@ -22,11 +22,11 @@ mp_drawing = mp.solutions.drawing_utils
 TARGET_RADIUS = 20
 MATCH_THRESHOLD = 40
 TARGETS_PER_CYCLE = 6
-TARGET_CYCLES = 1
+TARGET_CYCLES = 3
 CYCLE_TIME_LIMIT = 60  # seconds
 
 # Cycle order option: "random" or "predefined"
-CYCLE_ORDER = "predefined"  # Set this to "random" for random cycles or "predefined" for fixed cycle order
+CYCLE_ORDER = "random"  # Set this to "random" for random cycles or "predefined" for fixed cycle order
 
 # Session variables
 bounding_box_frozen = False
@@ -39,7 +39,7 @@ show_confetti = False
 confetti_start_time = None
 cycle_start_time = None
 current_cycle_type = None  # We'll set this dynamically based on the cycle order
-predefined_order = ["arrow"]
+predefined_order = ["arrow", "chair","star"]
 
 # Party Popper Confetti
 def draw_confetti(frame):
