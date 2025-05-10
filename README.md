@@ -41,6 +41,7 @@ _Coming soon: Include a GIF or screenshot showcasing the application's functiona
 ```bash
 python -m venv venv
 ```
+Note: based on python or python3
 
 3. **Activate a virtual environment**
 
@@ -67,3 +68,4 @@ Choose one of the following scripts depending on what you want to do:
   ```bash
   python main.py
   ```
+Note: based on python or python3
