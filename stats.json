@@ -1,0 +1,20 @@
+{
+    "high_scores": {
+        "Collector": 5650,
+        "Rhythm": 1650,
+        "Random": 0,
+        "Yoga": 6,
+        "Ninja": 450,
+        "Runner": 335,
+        "Slicer": 230,
+        "NinjaSlicer": 300
+    },
+    "games_played": {
+        "Collector": 60,
+        "Rhythm": 22,
+        "Random": 18,
+        "Yoga": 70,
+        "NinjaSlicer": 14
+    },
+    "total_nuts_collected": 1576
+}

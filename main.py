@@ -1,308 +1,203 @@
 import cv2
-import numpy as np
-import mediapipe as mp
-import random
 import pygame
 import time
-import math
+import mediapipe as mp
+from PyQt5 import QtWidgets, QtGui, QtCore
+import sys
+import signal
 
-# Initialize pygame for sound
-pygame.mixer.init()
-match_sound = pygame.mixer.Sound("sounds/ding.mp3")  # match sound
-unmatch_sound = pygame.mixer.Sound("sounds/unmatch.mp3")  # unmatch sound
-celebrate_sound = pygame.mixer.Sound("sounds/celebrate.mp3")  # unmatch sound
+from config import *
+from pose_utils import *
+from game_modes import GameModes
+from drawing_utils import DrawingUtils
 
-# Mediapipe Pose
-mp_pose = mp.solutions.pose
-pose = mp_pose.Pose(static_image_mode=False, model_complexity=1,
-                    enable_segmentation=False, min_detection_confidence=0.5)
-mp_drawing = mp.solutions.drawing_utils
+class PoseGameWindow(QtWidgets.QMainWindow):
+    STATE_MENU, STATE_GAME_MODE_SELECTION, STATE_IN_GAME_MENU = -3, -2, -1
+    STATE_STATS = -5
+    STATE_LANGUAGE_SELECTION = -4 
+    
+    STATE_WAITING_FOR_PLAYER, STATE_PLAYING_CYCLE, STATE_CYCLE_END_FEEDBACK, STATE_SESSION_COMPLETE = 0, 1, 2, 3
+    STATE_PLAYING_RHYTHM, STATE_PLAYING_DODGER, STATE_PLAYING_NINJA_SLICER = 4, 5, 6
 
-# Config
-TARGET_RADIUS = 20
-MATCH_THRESHOLD = 40
-TARGETS_PER_CYCLE = 6
-TARGET_CYCLES = 3
-CYCLE_TIME_LIMIT = 60  # seconds
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Pose Matching Game")
+        self.setGeometry(100, 100, 1280, 720)
+        self.showFullScreen()
 
-# Cycle order option: "random" or "predefined"
-CYCLE_ORDER = "random"  # Set this to "random" for random cycles or "predefined" for fixed cycle order
+        self.drawing_utils = DrawingUtils()
+        self.game_modes = GameModes(self)
 
-# Session variables
-bounding_box_frozen = False
-target_points = []
-matched_flags = []
-successful_cycles = 0
-total_cycles_attempted = 0
-session_complete = False
-show_confetti = False
-confetti_start_time = None
-cycle_start_time = None
-current_cycle_type = None  # We'll set this dynamically based on the cycle order
-predefined_order = ["arrow", "chair","star"]
+        self.central_widget = QtWidgets.QWidget()
+        self.setCentralWidget(self.central_widget)
+        self.layout = QtWidgets.QVBoxLayout(self.central_widget)
+        self.video_label = QtWidgets.QLabel("Waiting...")
+        self.video_label.setAlignment(QtCore.Qt.AlignCenter)
+        self.layout.addWidget(self.video_label)
 
-# Party Popper Confetti
-def draw_confetti(frame):
-    for _ in range(50):
-        x = random.randint(0, frame.shape[1])
-        y = random.randint(0, frame.shape[0])
-        color = (random.randint(100, 255), random.randint(100, 255), random.randint(100, 255))
-        cv2.circle(frame, (x, y), random.randint(5, 15), color, -1)
+        self.game_state = self.STATE_MENU
+        self.current_game_mode = None
+        self.previous_game_state = None
+        self.bounding_box_frozen = False
+        self.frozen_box = None
+        self.last_session_end_time = None
 
-def draw_bow_and_arrow_points(frame, center_x, center_y, size=200):
-    shaft_length = 300
-    arrow_tip = (center_x - shaft_length - 50 // 2, center_y)
-    arrow_start = (center_x + shaft_length // 2, center_y)
+        self.score = 0
+        self.combo = 1
+        self.feedback_text = ""
+        self.feedback_text_alpha = 0
+        self.feedback_display_start_time = 0
+        self.mode_selection_entry_time = None
 
-    # Bow arc dimensions
-    a = shaft_length // 2
-    b = int(size * 0.8)
-    cx, cy = center_x - 10, center_y
-
-    # Compute start and end points on the ellipse (270° to 90°)
-    angle_start = 90
-    angle_end = 270
-    rad_start = np.deg2rad(angle_start)
-    rad_end = np.deg2rad(angle_end)
-
-    bow_top = (
-        int(cx + a * np.cos(rad_start)),
-        int(cy + b * np.sin(rad_start))
-    )
-    bow_bottom = (
-        int(cx + a * np.cos(rad_end)),
-        int(cy + b * np.sin(rad_end))
-    )
-
-    # Draw arrow shaft
-    cv2.line(frame, arrow_start, arrow_tip, (255, 255, 255), 4)
-
-    # Draw arrowhead
-    head_size = 20
-    arrowhead_top = (arrow_tip[0] - head_size, arrow_tip[1] - head_size)
-    arrowhead_bottom = (arrow_tip[0] - head_size, arrow_tip[1] + head_size)
-    # cv2.line(frame, arrow_tip, arrowhead_top, (255, 255, 255), 4)
-    # cv2.line(frame, arrow_tip, arrowhead_bottom, (255, 255, 255), 4)
-
-    # Draw bow arc
-    cv2.ellipse(frame, (cx, cy), (a, b), 0, angle_start, angle_end, (255, 255, 255), 4)
-    cv2.line(frame, bow_top, bow_bottom, (255, 255, 255), 4)
-
-    # Draw the four target points
-    target_points = [bow_top, bow_bottom, arrow_start, arrow_tip]
-
-
-    return target_points
-
-
-# Utility functions
-def get_bounding_box(landmarks, image_shape):
-    h, w = image_shape
-    x_coords = [int(l.x * w) for l in landmarks if l.visibility > 0.5]
-    y_coords = [int(l.y * h) for l in landmarks if l.visibility > 0.5]
-    if not x_coords or not y_coords:
-        return None
-    return (max(min(x_coords), 0), max(min(y_coords), 0),
-            min(max(x_coords), w), min(max(y_coords), h))
-
-def is_full_body_visible(landmarks):
-    required = [mp_pose.PoseLandmark.NOSE,
-                mp_pose.PoseLandmark.LEFT_SHOULDER,
-                mp_pose.PoseLandmark.RIGHT_SHOULDER,
-                mp_pose.PoseLandmark.LEFT_ANKLE,
-                mp_pose.PoseLandmark.RIGHT_ANKLE]
-    return all(landmarks[j].visibility > 0.5 for j in required)
-
-def is_hand_above_head_with_ankle_visible(landmarks):
-    left_wrist = landmarks[mp_pose.PoseLandmark.LEFT_WRIST]
-    right_wrist = landmarks[mp_pose.PoseLandmark.RIGHT_WRIST]
-    nose = landmarks[mp_pose.PoseLandmark.NOSE]
-    left_ankle = landmarks[mp_pose.PoseLandmark.LEFT_ANKLE]
-    right_ankle = landmarks[mp_pose.PoseLandmark.RIGHT_ANKLE]
-
-    # Wrist above head (nose y)
-    wrist_above_head = (
-        (left_wrist.visibility > 0.5 and nose.visibility > 0.5 and left_wrist.y < nose.y) or
-        (right_wrist.visibility > 0.5 and nose.visibility > 0.5 and right_wrist.y < nose.y)
-    )
-
-    # At least one ankle visible
-    ankle_visible = (
-        (left_ankle.visibility > 0.5) or (right_ankle.visibility > 0.5)
-    )
-
-    return wrist_above_head and ankle_visible
-
-
-def generate_target_points(bbox, num_targets, pattern="random"):
-    x_min, y_min, x_max, y_max = bbox
-    margin = 20
-
-    if pattern == "chair":
-        # Chair pattern: 2 points for "seat" and 2 for "backrest"
-        center_x, center_y = (x_min + x_max) // 2, (y_min + y_max) // 2
-        targets = [
-            (center_x - 50, center_y + 100),  # Seat left
-            (center_x + 50, center_y + 100),  # Seat right
-            (center_x - 50, center_y - 100),  # Backrest left
-            (center_x + 50, center_y - 100)   # Backrest right
-        ]
-        return targets
-
-    elif pattern == "arrow":
-        center_x, center_y = (x_min + x_max) // 2, (y_min + y_max) // 2
-        return draw_bow_and_arrow_points(bbox, center_x, center_y, 200)
+        self.target_points, self.matched_flags, self.successful_cycles, self.total_cycles_attempted, self.cycle_start_time, self.cycle_end_message = [], [], 0, 0, None, ""
+        self.rhythm_sequence, self.rhythm_current_step, self.rhythm_target_start_time = [], 0, 0
+        self.dodger_objects, self.dodger_lives, self.dodger_start_time, self.dodger_spawn_timer = [], 0, 0, 0
+        self.ninja_slicer_objects, self.ninja_slicer_lives, self.ninja_slicer_spawn_timer = [], 0, 0
+        self.left_hand_trail, self.right_hand_trail = [], []
+        self.left_hand_rect, self.right_hand_rect = None, None
         
-    elif pattern == "star":
-        # Star pattern: Points arranged in a star shape
-        center_x, center_y = (x_min + x_max) // 2, (y_min + y_max) // 2
-        radius = 200
-        angle_step = 72  # 360° / 5 points (5-pointed star)
-        targets = []
+        self.session_snapshots = []
+        self.display_snapshots = []
+        self.pause_start_time = None
         
-        # Calculate the 5 points of the star
-        for i in range(5):
-            angle = math.radians(i * angle_step)
-            target_x = int(center_x + radius * math.cos(angle))
-            target_y = int(center_y + radius * math.sin(angle))
-            targets.append((target_x, target_y))
+        self.confetti_particles = []
+        self.confetti_triggered_this_session = False
+        
+        self.pose_start_time = {k: None for k in ["start_game", "random_mode", "yoga_mode", "rhythm_mode", "dodger_mode", "ninja_slicer_mode", "back_to_main_from_mode_select", "resume_game", "ingame_main_menu", "ingame_exit", "t_pose_menu", "restart_session", "no_pose_detected_pause", "view_stats", "select_language", "language_en", "language_de"]}
 
-        # Draw the lines between the points to form the star
-        for i in range(5):
-            # Connect each point to the next, forming a star
-            start_point = targets[i]
-            end_point = targets[(i + 2) % 5]  # Connect each point to the second next
-            cv2.line(frame, start_point, end_point, (255, 255, 255), 4)  # White lines
+        self.cap = cv2.VideoCapture(0)
+        self.timer = QtCore.QTimer(self)
+        self.timer.timeout.connect(self.update_frame)
+        self.timer.start(30)
+        print("Game Initialized.")
 
-          # Red points
-        return targets
+    def start_game_mode(self, mode):
+        self.reset_game_progress()
+        self.current_game_mode = mode
+        if mode in ['random', 'yoga', 'rhythm', 'dodger', 'ninja_slicer']:
+            self.game_state = self.STATE_WAITING_FOR_PLAYER
+            print(f"Starting {mode.title()} Mode...")
 
-    else:
-        # Random pattern: Random targets within bounding box
-        return [(random.randint(x_min - margin, x_max + margin),
-                 random.randint(y_min - margin, y_max + margin)) for _ in range(num_targets)]
+    def reset_game_progress(self):
+        self.score, self.combo, self.feedback_text_alpha = 0, 1, 0
+        self.bounding_box_frozen, self.frozen_box, self.last_session_end_time = False, None, None
+        self.successful_cycles, self.total_cycles_attempted, self.session_snapshots, self.display_snapshots = 0, 0, [], []
+        self.rhythm_sequence, self.rhythm_current_step = [], 0
+        self.dodger_objects, self.dodger_lives = [], 0
+        self.ninja_slicer_objects, self.ninja_slicer_lives = [], 0
+        self.left_hand_trail, self.right_hand_trail = [], []
+        self.left_hand_rect, self.right_hand_rect = None, None
+        for key in self.pose_start_time:
+            self.pose_start_time[key] = None
+        self.confetti_particles = []
+        self.confetti_triggered_this_session = False
+        
+    def reset_cycle(self):
+        mode_reset_map = {
+            'random': self.game_modes.reset_random_mode_cycle, 
+            'yoga': self.game_modes.reset_yoga_mode_cycle, 
+            'rhythm': self.game_modes.reset_rhythm_mode_cycle, 
+            'dodger': self.game_modes.reset_dodger_mode_cycle,
+            'ninja_slicer': self.game_modes.reset_ninja_slicer_mode_cycle
+        }
+        reset_func = mode_reset_map.get(self.current_game_mode)
+        if reset_func:
+            reset_func()
 
-def match_points_to_keypoints(targets, landmarks, image_shape):
-    h, w = image_shape
-    matched = []
-    for tx, ty in targets:
-        match_found = False
-        for lm in landmarks:
-            if lm.visibility < 0.5:
-                continue
-            lx, ly = int(lm.x * w), int(lm.y * h)
-            dist = np.linalg.norm(np.array([lx, ly]) - np.array([tx, ty]))
-            if dist < MATCH_THRESHOLD:
-                match_found = True
-                break
-        matched.append(match_found)
-    return matched
+    def add_score(self, points):
+        self.score += points * self.combo
 
-# Start camera
-cap = cv2.VideoCapture(0)
+    def trigger_feedback(self, text):
+        self.feedback_text, self.feedback_text_alpha = text, 255
 
-while cap.isOpened():
-    ret, frame = cap.read()
-    if not ret:
-        break
+    def handle_pose_trigger(self, pose_detected, pose_key, action_function):
+        if pose_detected:
+            if self.pose_start_time[pose_key] is None:
+                self.pose_start_time[pose_key] = time.time()
+            if time.time() - self.pose_start_time[pose_key] >= POSE_HOLD_TIME:
+                action_function()
+                for key in self.pose_start_time:
+                    self.pose_start_time[key] = None
+                return True
+        else:
+            self.pose_start_time[pose_key] = None
+        return False
 
-    frame = cv2.flip(frame, 1)
-    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    results = pose.process(rgb)
+    def update_frame(self):
+        ret, frame = self.cap.read()
+        if not ret:
+            self.timer.stop()
+            return
 
-    if results.pose_landmarks and not session_complete:
-        landmarks = results.pose_landmarks.landmark
+        h, w, _ = frame.shape 
+        frame = cv2.flip(frame, 1)
+        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        results = pose.process(rgb_frame)
+        landmarks = results.pose_landmarks.landmark if results.pose_landmarks else None
+        
+        display_frame = frame.copy()
 
-        # Setup for first time
-        if False or (not bounding_box_frozen and is_full_body_visible(landmarks)):
-            bbox = get_bounding_box(landmarks, frame.shape[:2])
-            if bbox:
-                bounding_box_frozen = True
-                frozen_box = bbox
-                
-                # Initialize first cycle based on the selected order
-                if CYCLE_ORDER == "random":
-                    current_cycle_type = "random"  # Generate random targets each cycle
-                else:
-                    # Predefined order, cycling through patterns
-                    current_cycle_type = predefined_order[total_cycles_attempted % len(predefined_order)]
-                
-                target_points = generate_target_points(frozen_box, TARGETS_PER_CYCLE, current_cycle_type)
-                cycle_start_time = time.time()
+        if self.game_state == self.STATE_MENU:
+            self.drawing_utils.draw_main_menu(self, display_frame, landmarks)
+        elif self.game_state == self.STATE_GAME_MODE_SELECTION:
+            self.drawing_utils.draw_game_mode_selection(self, display_frame, landmarks)
+        elif self.game_state == self.STATE_WAITING_FOR_PLAYER:
+            if landmarks:
+                mp_drawing.draw_landmarks(display_frame, results.pose_landmarks, mp_pose.POSE_CONNECTIONS)
+            self.drawing_utils.draw_text(display_frame, "Stand in the center of the frame!", (w // 2, h // 2), 36, (255,255,255), align="center")
+            if landmarks and is_full_body_visible(landmarks):
+                self.frozen_box = get_bounding_box(landmarks, frame.shape[:2])
+                if self.frozen_box:
+                    self.bounding_box_frozen = True
+                    self.reset_cycle()
+        elif self.game_state in [self.STATE_PLAYING_CYCLE, self.STATE_PLAYING_RHYTHM, self.STATE_PLAYING_DODGER, self.STATE_PLAYING_NINJA_SLICER]:
+            game_mode_map = {
+                self.STATE_PLAYING_CYCLE: self.game_modes.run_cycle_frame,
+                self.STATE_PLAYING_RHYTHM: self.game_modes.run_rhythm_game_frame,
+                self.STATE_PLAYING_DODGER: self.game_modes.run_dodger_game_frame,
+                self.STATE_PLAYING_NINJA_SLICER: self.game_modes.run_ninja_slicer_game_frame
+            }
+            game_mode_map[self.game_state](display_frame, landmarks, rgb_frame)
+        elif self.game_state == self.STATE_SESSION_COMPLETE:
+             self.drawing_utils.draw_session_complete(self, display_frame, landmarks)
 
-        if bounding_box_frozen:
-            x1, y1, x2, y2 = frozen_box
-            cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 255), 2)
+        if self.game_state not in [self.STATE_MENU, self.STATE_GAME_MODE_SELECTION]:
+             self.drawing_utils.draw_hud(self, display_frame)
+        
+        self.drawing_utils.draw_feedback_text(self, display_frame)
 
-            matched_flags = match_points_to_keypoints(target_points, landmarks, frame.shape[:2])
-            all_matched = all(matched_flags)
+        h, w, ch = display_frame.shape
+        qt_img = QtGui.QImage(display_frame.data, w, h, ch * w, QtGui.QImage.Format_RGB888).rgbSwapped()
+        self.video_label.setPixmap(QtGui.QPixmap.fromImage(qt_img.scaled(self.video_label.width(), self.video_label.height(), QtCore.Qt.KeepAspectRatio)))
 
-            # Draw targets
-            for i, (x, y) in enumerate(target_points):
-                color = (0, 255, 0) if matched_flags[i] else (0, 0, 255)
-                cv2.circle(frame, (x, y), TARGET_RADIUS, color, -1)
+    def go_to_game_mode_selection(self):
+        self.game_state = self.STATE_GAME_MODE_SELECTION
+        self.mode_selection_entry_time = time.time()
+        for key in self.pose_start_time:
+            self.pose_start_time[key] = None
 
-            # Timer handling
-            elapsed = time.time() - cycle_start_time
-            time_left = max(0, int(CYCLE_TIME_LIMIT - elapsed))
-            cv2.putText(frame, f"Time Left: {time_left}s", (30, 130),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
-            cv2.putText(frame, f"Cycle: {total_cycles_attempted+1}/{TARGET_CYCLES}", (30, 170),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 0), 2)
+    def cleanup(self):
+        print("\n--- Cleaning up... ---")
+        self.cap.release()
+        self.timer.stop()
+        pose.close()
+        pygame.quit()
+        print("Resources released.")
 
-            # After elapsed time or match complete:
-            if elapsed > CYCLE_TIME_LIMIT or all_matched:
+    def closeEvent(self, event):
+        self.cleanup()
+        event.accept()
 
-                # Always increment total attempted cycles
-                total_cycles_attempted += 1
+if __name__ == "__main__":
+    app = QtWidgets.QApplication(sys.argv)
+    window = PoseGameWindow()
+    window.show()
 
-                if all_matched and elapsed <= CYCLE_TIME_LIMIT:
-                    successful_cycles += 1
-                    match_sound.play()
-                else:
-                    unmatch_sound.play()
-                    pass
+    def signal_handler(sig, frame):
+        print('Signal received, shutting down cleanly.')
+        window.cleanup()
+        app.quit()
 
-                # Check session complete
-                if total_cycles_attempted >= TARGET_CYCLES:
-                    session_complete = True
-                else:
-                    # Prepare next cycle based on the selected order
-                    if CYCLE_ORDER == "random":
-                        target_points = generate_target_points(frozen_box, TARGETS_PER_CYCLE, "random")
-                    else:
-                        current_cycle_type = predefined_order[total_cycles_attempted % len(predefined_order)]
-                        target_points = generate_target_points(frozen_box, TARGETS_PER_CYCLE, current_cycle_type)
+    signal.signal(signal.SIGINT, signal_handler)
 
-                    cycle_start_time = time.time()
-
-        mp_drawing.draw_landmarks(frame, results.pose_landmarks, mp_pose.POSE_CONNECTIONS)
-
-    elif session_complete:
-        cv2.putText(frame, f"Session Complete! Score: {successful_cycles}/{TARGET_CYCLES}",
-                    (30, 50), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 3)
-        cv2.putText(frame, "Press 'N' to start a new session or ESC to exit.",
-                    (30, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (200, 200, 200), 2)
-
-        if successful_cycles == TARGET_CYCLES and not show_confetti:
-            show_confetti = True
-            confetti_start_time = time.time()
-
-        if show_confetti:
-            draw_confetti(frame)
-            celebrate_sound.play()
-            if time.time() - confetti_start_time > 3:  # Show confetti for 3 seconds
-                show_confetti = False
-                successful_cycles = 0
-                session_complete = False
-                bounding_box_frozen=False
-
-    # Show frame
-    cv2.imshow("Pose Matching Game", frame)
-    if cv2.waitKey(1) & 0xFF == 27:
-        break
-
-cap.release()
-cv2.destroyAllWindows()
-
-
+    sys.exit(app.exec_())

@@ -2,3 +2,6 @@ opencv-python
 numpy
 mediapipe
 pygame
+screeninfo
+PyQt5
+pyserial
